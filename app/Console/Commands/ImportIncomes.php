@@ -4,70 +4,99 @@ namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
+use App\Models\ApiToken;
+use App\Models\Income;
+
 class ImportIncomes extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
-    protected $signature = 'import:income';
+    protected $signature = 'import:incomes';
+    protected $description = 'Импорт поступлений (incomes) для всех аккаунтов и сервисов';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Command import incomes';
-
-    /**
-     * Create a new command instance.
-     *
-     * @return void
-     */
-    public function __construct()
-    {
-        parent::__construct();
-    }
-
-    /**
-     * Execute the console command.
-     *
-     * @return int
-     */
     public function handle()
     {
-        $page = 1;
-        $limit = 500;
-        $imported = 0;
+        $this->info('Старт импорта incomes...');
 
-        while ($imported < $limit) {
-            $response = Http::get("http://109.73.206.144:6969/api/incomes", [
-                'dateFrom' => '2024-01-01',
-                'dateTo' => now()->format('Y-m-d'),
-                'page' => $page,
-                'limit' => 100,
-                'key' => 'E6kUTYrYwZq2tN4QEtyzsbEBk3ie',
-            ]);
+        $tokens = ApiToken::with(['account', 'apiService', 'tokenType'])
+            ->whereHas('apiService', function ($q) {
+                $q->where('name', 'Custom API');
+            })
+            ->get();
 
-            $data = $response->json('data');
-
-            if (empty($data)) {
-                break;
-            }
-
-            foreach ($data as $item) {
-                \App\Models\Income::updateOrCreate(
-                    ['income_id' => $item['income_id'] ?? null],
-                    $item
-                );
-                $imported++;
-                if ($imported >= $limit) {
-                    break 2;
-                }
-            }
-
-            $page++;
+        if ($tokens->isEmpty()) {
+            $this->warn('Нет токенов для импорта incomes.');
+            return 0;
         }
+
+        foreach ($tokens as $token) {
+            $accountId = $token->account_id;
+            $serviceUrl = rtrim($token->apiService->base_url, '/');
+            $apiKey = $token->token;
+
+            $this->info("Импорт для аккаунта {$token->account->name} (ID: $accountId), сервис {$token->apiService->name}");
+
+            $lastDate = Income::where('account_id', $accountId)->max('date') ?? '2024-01-01';
+
+            $page = 1;
+            $imported = 0;
+            $limit = 100;
+            $maxPages = 1000;
+
+            while ($page <= $maxPages) {
+                $response = Http::get("$serviceUrl/incomes", [
+                    'dateFrom' => $lastDate,
+                    'dateTo' => now()->format('Y-m-d'),
+                    'page' => $page,
+                    'limit' => $limit,
+                    'key' => $apiKey,
+                ]);
+
+                if ($response->status() == 429) {
+                    $this->warn('Too many requests, ждем 60 секунд...');
+                    sleep(60);
+                    continue;
+                }
+
+                if ($response->failed()) {
+                    $this->error('Ошибка запроса: ' . $response->body());
+                    break;
+                }
+
+                $json = $response->json();
+                $data = $json['data'] ?? [];
+                $meta = $json['meta'] ?? [];
+
+                if (!is_array($data) || count($data) === 0) {
+                    $this->info("Нет новых данных для аккаунта $accountId (страница $page).");
+                    break;
+                }
+
+                foreach ($data as $item) {
+                    $item['account_id'] = $accountId;
+                    $externalId = $item['external_id'] ?? md5(json_encode($item));
+                    $item['external_id'] = $externalId;
+
+                    Income::updateOrCreate(
+                        [
+                            'external_id' => $externalId,
+                            'account_id' => $accountId,
+                        ],
+                        $item
+                    );
+                    $imported++;
+                }
+
+                $this->info("Загружено записей: $imported для аккаунта $accountId (страница $page)");
+
+                // Если это последняя страница — выходим
+                if (isset($meta['last_page']) && $page >= $meta['last_page']) {
+                    break;
+                }
+
+                $page++;
+            }
+        }
+
+        $this->info('Импорт incomes завершён.');
+        return 0;
     }
 }

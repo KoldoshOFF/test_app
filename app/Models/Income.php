@@ -21,6 +21,8 @@ class Income extends Model
         'date_close',
         'warehouse_name',
         'nm_id',
+        'account_id',
+        'external_id',
     ];
 
     protected $casts = [
